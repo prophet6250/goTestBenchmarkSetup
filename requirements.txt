@@ -1,0 +1,8 @@
+beautifulsoup4
+lxml
+matplotlib
+openpyxl
+pandas
+Pillow
+XlsxWriter
+Jinja2

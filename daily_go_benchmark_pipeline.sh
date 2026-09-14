@@ -1,431 +1,252 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# ============================================================
-# DAILY GO BENCHMARK PIPELINE
-# ============================================================
-#
-# This script performs:
-#
-# 1. Checkout latest Go master branch
-# 2. Build Go toolchain
-# 3. Run ALL src micro-benchmarks (6 iterations)
-# 4. Compare with previous day's results
-# 5. Generate:
-#       - benchstat.txt
-#       - report.xlsx
-#       - report.html
-# 6. Store metadata and logs
-#
-# ============================================================
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-echo "Installing python3 dependency packages..."
-apt-get update -y
-
-apt-get install -y python3-pip
-apt-get install -y python3.12-venv
-apt-get install -y libjpeg-dev zlib1g-dev
-
-python3 -m venv .venv
-source .venv/bin/activate
-sudo apt update
-sudo apt install libjpeg-dev zlib1g-dev
-pip install --no-cache-dir pillow
-pip install pandas matplotlib openpyxl
-pip install XlsxWriter
-pip install jinja2
-pip install beautifulsoup4 lxml
-
-BASE_DIR="$HOME/benchmarkTests"
-
-GO_DIR="$HOME/go"
+SCRIPT_SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BASE_DIR=${BENCHMARK_HOME:-"$HOME/benchmarkTests"}
+GO_DIR="$BASE_DIR/go"
 RESULTS_DIR="$BASE_DIR/results"
 LOG_DIR="$BASE_DIR/logs"
 SCRIPT_DIR="$BASE_DIR/scripts"
-
 TODAY=$(date +%F)
-YESTERDAY=$(date -d "yesterday" +%F)
+
+usage() {
+    echo "Usage: $0 [--tag TAG | --commit HASH]"
+    echo ""
+    echo "With --tag or --commit, build and benchmark the specified Go revision."
+    echo "Without either option, clone/update and benchmark the current master branch."
+}
+
+# Select the package manager available on the host.
+detect_package_manager() {
+    local manager
+    for manager in apt-get dnf yum pacman zypper brew; do
+        if command -v "$manager" >/dev/null 2>&1; then
+            PACKAGE_MANAGER=$manager
+            return 0
+        fi
+    done
+    echo "No supported package manager found (apt, dnf, yum, pacman, zypper, brew)." >&2
+    exit 1
+}
+
+# Resolve distro-specific package names.
+package_name() {
+    local package=$1
+    case "$PACKAGE_MANAGER:$package" in
+        apt-get:python) echo python3 ;;
+        apt-get:pip) echo python3-pip ;;
+        apt-get:venv) echo python3-venv ;;
+        apt-get:jpeg) echo libjpeg-dev ;;
+        apt-get:zlib) echo zlib1g-dev ;;
+        apt-get:taskset) echo util-linux ;;
+        dnf:python|yum:python) echo python3 ;;
+        dnf:pip|yum:pip) echo python3-pip ;;
+        dnf:venv|yum:venv) echo python3-virtualenv ;;
+        dnf:jpeg|yum:jpeg) echo libjpeg-turbo-devel ;;
+        dnf:zlib|yum:zlib) echo zlib-devel ;;
+        dnf:taskset|yum:taskset) echo util-linux ;;
+        pacman:python) echo python ;;
+        pacman:pip) echo python-pip ;;
+        pacman:venv) echo python-virtualenv ;;
+        pacman:jpeg) echo libjpeg-turbo ;;
+        pacman:zlib) echo zlib ;;
+        pacman:taskset) echo util-linux ;;
+        zypper:python) echo python3 ;;
+        zypper:pip) echo python3-pip ;;
+        zypper:venv) echo python3-virtualenv ;;
+        zypper:jpeg) echo libjpeg-turbo-devel ;;
+        zypper:zlib) echo zlib-devel ;;
+        zypper:taskset) echo util-linux ;;
+        brew:python) echo python ;;
+        brew:pip) echo python ;;
+        brew:venv) echo python ;;
+        brew:jpeg) echo jpeg ;;
+        brew:zlib) echo zlib ;;
+        brew:taskset) echo util-linux ;;
+        *) echo "$package" ;;
+    esac
+}
+
+# Install named logical packages through the detected package manager.
+install_packages() {
+    local package
+    local resolved=()
+    for package in "$@"; do
+        resolved+=("$(package_name "$package")")
+    done
+    case "$PACKAGE_MANAGER" in
+        apt-get) run_as_root apt-get update -y; run_as_root apt-get install -y "${resolved[@]}" ;;
+        dnf) run_as_root dnf install -y "${resolved[@]}" ;;
+        yum) run_as_root yum install -y "${resolved[@]}" ;;
+        pacman) run_as_root pacman -Sy --noconfirm "${resolved[@]}" ;;
+        zypper) run_as_root zypper --non-interactive install "${resolved[@]}" ;;
+        brew) brew install "${resolved[@]}" ;;
+    esac
+}
+
+# Run a command as root when the current user is not root.
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        command -v sudo >/dev/null 2>&1 || { echo "sudo is required to install system packages." >&2; exit 1; }
+        sudo "$@"
+    fi
+}
+
+# Find the first pair of logical CPUs listed as siblings by sysfs.
+find_sibling_pair() {
+    local topology list first second start
+    for topology in /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list; do
+        [ -r "$topology" ] || continue
+        list=$(tr -d '[:space:]' < "$topology")
+        if [[ "$list" == *,* ]]; then
+            first=${list%%,*}
+            second=${list#*,}
+        elif [[ "$list" == *-* ]]; then
+            start=${list%%-*}
+            first=$start
+            second=$((start + 1))
+        else
+            continue
+        fi
+        [ "$first" != "$second" ] || continue
+        CPU_SIBLING_PAIR="$first,$second"
+        return 0
+    done
+    return 1
+}
+
+# Parse the explicitly requested revision, if any.
+parse_args() {
+    REVISION_MODE=master
+    REVISION=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --tag|--commit)
+                [ "$#" -ge 2 ] || { echo "$1 requires a value." >&2; usage >&2; exit 2; }
+                [ -z "$REVISION" ] || { echo "Specify only one of --tag or --commit." >&2; exit 2; }
+                REVISION_MODE=$1
+                REVISION=$2
+                shift 2
+                ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+}
+
+parse_args "$@"
+detect_package_manager
+install_packages git make gcc python pip venv jpeg zlib taskset
+
+mkdir -p "$BASE_DIR" "$RESULTS_DIR" "$LOG_DIR" "$SCRIPT_DIR"
+cp "$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh" "$SCRIPT_DIR/"
+cp "$SCRIPT_SOURCE_DIR/generate_dashboard.py" "$SCRIPT_DIR/"
+cp "$SCRIPT_SOURCE_DIR/generate_excel.py" "$SCRIPT_DIR/"
+cp "$SCRIPT_SOURCE_DIR/requirements.txt" "$SCRIPT_DIR/"
+chmod 0755 "$SCRIPT_DIR/daily_go_benchmark_pipeline.sh"
+
+VENV_DIR="$BASE_DIR/.venv"
+python3 -m venv "$VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+python -m pip install --no-cache-dir -r "$SCRIPT_SOURCE_DIR/requirements.txt"
 
 TODAY_DIR="$RESULTS_DIR/$TODAY"
-YESTERDAY_DIR="$RESULTS_DIR/$YESTERDAY"
-
-# ================================================================
-# Create a "Base" directory for this project, if it doesn't exist
-# ================================================================
-if [ ! -d "$BASE_DIR" ]; then
-    mkdir -p "$BASE_DIR"
-    echo "benchmarkTests directory created: $BASE_DIR"
-else
-    echo "benchmarkTests directory already exists: $BASE_DIR"
-fi
-
-
-# =================================================================================
-# Create a "Scripts" directory and copy all the scripts, if it not done previously
-# =================================================================================
-if [ ! -d "$SCRIPT_DIR" ]; then
-    mkdir -p "$SCRIPT_DIR"
-    echo "scripts directory created: $SCRIPT_DIR"
-    find / -type f -name "daily_go_benchmark_pipeline.sh" -exec cp {} "$SCRIPT_DIR/" \; 2>/dev/null
-    find / -type f -name "generate_dashboard.py" -exec cp {} "$SCRIPT_DIR/" \; 2>/dev/null
-    find / -type f -name "generate_excel.py" -exec cp {} "$SCRIPT_DIR/" \; 2>/dev/null
-    chmod 0755 -R "$SCRIPT_DIR/"/*
-else
-    echo "scripts directory already exists: $SCRIPT_DIR"
-fi
-
-# ==================================================
-# Create a "Results" directory, if it doesn't exist
-# ==================================================
-if [ ! -d "$RESULTS_DIR" ]; then
-    mkdir -p "$RESULTS_DIR"
-    echo "results directory created: $RESULTS_DIR"
-else
-    echo "results directory already exists: $RESULTS_DIR"
-fi
-
 mkdir -p "$TODAY_DIR"
-mkdir -p "$LOG_DIR"
-
 LOG_FILE="$LOG_DIR/daily_pipeline_$TODAY.log"
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 exec > >(tee -a "$LOG_FILE") 2>&1
-
-echo ""
-echo "=========================================================="
-echo "🚀 STARTING DAILY GO BENCHMARK PIPELINE"
-echo "=========================================================="
-echo "DATE            : $TODAY"
-echo "BASE DIRECTORY  : $BASE_DIR"
-echo "GO DIRECTORY    : $GO_DIR"
-echo "RESULT DIRECTORY: $TODAY_DIR"
-echo "LOG FILE        : $LOG_FILE"
-echo "=========================================================="
-echo ""
-
 START_TIME=$(date +%s)
 
-# ============================================================
-# STEP 1: UPDATE GO MASTER
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 1: CHECKOUT LATEST GO MASTER"
-echo "=========================================================="
-
-if [ ! -d "$GO_DIR" ]; then
-    git clone https://go.googlesource.com/go --recursive
-    echo "Clone the go repo..."
-else
-    echo "go directory already exists: $GO_DIR"
+if [ ! -d "$GO_DIR/.git" ]; then
+    clone_attempt=1
+    while ! git clone https://go.googlesource.com/go "$GO_DIR" --recursive; do
+        echo "Go repository clone attempt $clone_attempt failed."
+        [ "$clone_attempt" -lt 2 ] || { echo "Unable to clone the Go repository after 2 attempts." >&2; exit 1; }
+        clone_attempt=$((clone_attempt + 1))
+        sleep 5
+    done
 fi
 
 cd "$GO_DIR"
-
-echo "Checking out master branch..."
-git checkout master
-
-echo "Pulling latest changes..."
-git pull origin master
-
+if [ "$REVISION_MODE" = master ]; then
+    git fetch origin master
+    git checkout master
+    git reset --hard origin/master
+else
+    git fetch --tags origin
+    git checkout --detach "$REVISION"
+fi
 CURRENT_COMMIT=$(git rev-parse HEAD)
 
-echo ""
-echo "Current Commit:"
-echo "$CURRENT_COMMIT"
-
-# ============================================================
-# STEP 2: BUILD GO
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 2: BUILDING GO TOOLCHAIN"
-echo "=========================================================="
-
 cd "$GO_DIR/src"
+if ! ./make.bash; then
+    echo "Go toolchain build failed." >&2
+    exit 1
+fi
 
-echo "Running make.bash..."
-./make.bash
-
-echo ""
-echo "✅ Go build completed successfully"
-
-# ============================================================
-# STEP 3: RUN ALL SRC MICRO-BENCHMARKS
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 3: RUNNING ALL SRC MICRO-BENCHMARKS"
-echo "=========================================================="
-
-cd "$GO_DIR/src"
-
+if ! find_sibling_pair; then
+    echo "No adjacent logical CPU sibling pair was found; benchmark affinity is required." >&2
+    exit 1
+fi
+command -v taskset >/dev/null 2>&1 || { echo "taskset is required for benchmark CPU affinity." >&2; exit 1; }
 RAW_BENCH="$TODAY_DIR/benchmark_raw.txt"
 
-echo ""
-echo "Benchmark output file:"
-echo "$RAW_BENCH"
-
-echo ""
-echo "Running all src benchmarks..."
-echo "Benchmark count: 6"
-echo ""
-
-# ------------------------------------------------------------
-# IMPORTANT:
-# taskset is used for CPU affinity to reduce benchmark noise
-# ------------------------------------------------------------
-
-    # Adjust the "test.count" & "test.benchtime" values accordingly
-    ./../bin/go test ./... -run=^$ -bench=. -benchmem -test.count=6 -test.benchtime=2s > "$RAW_BENCH"
-
-echo ""
-echo "✅ Benchmark execution completed"
-
-# ============================================================
-# STEP 4: GENERATE BENCHSTAT
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 4: GENERATING BENCHSTAT"
-echo "=========================================================="
-
-
-# ============================================================
-# FIND PREVIOUS BENCHMARK RESULT
-# ============================================================
-
-echo ""
-echo "Searching for previous benchmark results..."
-
-CURRENT_RAW="$TODAY_DIR/benchmark_raw.txt"
-
-PREV_RAW=$(
-    find "$RESULTS_DIR" \
-        -name benchmark_raw.txt \
-        ! -path "$CURRENT_RAW" \
-        | sort \
-        | tail -1
-)
-
-if [ -z "$PREV_RAW" ]; then
-
-    echo ""
-    echo "⚠️ No previous benchmark result found"
-
-    echo ""
-    echo "Skipping benchstat comparison"
-    echo "Skipping Excel generation"
-    echo "Skipping Dashboard generation"
-
-    exit 0
+if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
+    echo "Benchmark execution failed." >&2
+    exit 1
 fi
 
-echo ""
-echo "Using previous benchmark:"
-echo "$PREV_RAW"
-
+# Metadata is written before comparison so it is preserved on a first run.
 BENCHSTAT_FILE="$TODAY_DIR/benchstat.txt"
-
-echo ""
-echo "Previous benchmark:"
-echo "$PREV_RAW"
-
-echo ""
-echo "Current benchmark:"
-echo "$RAW_BENCH"
-
-echo ""
-echo "Generating benchstat..."
-
-# Ensure benchstat exists
-command -v benchstat >/dev/null 2>&1 || {
-    echo "benchstat not found. Installing...."
-    go install golang.org/x/perf/cmd/benchstat@latest
-    echo "done."
-}
-
-benchstat -format=text \
-    "$PREV_RAW" \
-    "$RAW_BENCH" \
-    > "$BENCHSTAT_FILE"
-
-echo ""
-echo "✅ benchstat.txt generated"
-
-# ============================================================
-# STEP 5: GENERATE EXCEL REPORT
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 5: GENERATING EXCEL REPORT"
-echo "=========================================================="
-
 EXCEL_REPORT="$TODAY_DIR/report.xlsx"
-
-python3 "$SCRIPT_DIR/generate_excel.py" \
-    "$BENCHSTAT_FILE" \
-    "$EXCEL_REPORT"
-
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "❌ Excel report generation failed"
-    exit 1
-fi
-
-echo ""
-echo "✅ Excel report generated"
-
-# ============================================================
-# STEP 6: GENERATE HTML DASHBOARD
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 6: GENERATING HTML DASHBOARD"
-echo "=========================================================="
-
 HTML_REPORT="$TODAY_DIR/report.html"
-
-# ------------------------------------------------------------
-# Dashboard state tracking
-#
-# dashboard_state.json stores:
-#   - packages classified as improvements
-#   - packages classified as regressions
-#
-# This allows the dashboard to identify:
-#   - NEW improvements
-#   - NEW regressions
-# compared to the previous run.
-# ------------------------------------------------------------
-
 STATE_FILE="$TODAY_DIR/dashboard_state.json"
-
-PREV_STATE=""
-
-if [ -f "$(dirname "$PREV_RAW")/dashboard_state.json" ]; then
-    PREV_STATE="$(dirname "$PREV_RAW")/dashboard_state.json"
-
-    echo ""
-    echo "Previous dashboard state:"
-    echo "$PREV_STATE"
-else
-    echo ""
-    echo "No previous dashboard state found"
-    echo "New improvement/regression sections will be based on an empty baseline"
-fi
-
-BASELINE_DATE=$(basename "$(dirname "$PREV_RAW")")
-
-PREVIOUS_COMMIT="Unknown"
-
-PREV_METADATA="$(dirname "$PREV_RAW")/metadata.txt"
-
-if [ -f "$PREV_METADATA" ]; then
-
-    PREVIOUS_COMMIT=$(grep "^Commit:" "$PREV_METADATA" \
-        | head -1 \
-        | cut -d' ' -f2)
-
-fi
-
-echo ""
-echo "Generating HTML dashboard..."
-
-python3 "$SCRIPT_DIR/generate_dashboard.py" \
-    "$BENCHSTAT_FILE" \
-    "$HTML_REPORT" \
-    "$TODAY" \
-    "$BASELINE_DATE" \
-    "$CURRENT_COMMIT" \
-    "$PREVIOUS_COMMIT" \
-    "$STATE_FILE" \
-    "$PREV_STATE"
-
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "❌ Dashboard generation failed"
-    exit 1
-fi
-
-echo ""
-echo "✅ HTML dashboard generated"
-
-echo ""
-echo "Dashboard State:"
-echo "$STATE_FILE"
-
-# ============================================================
-# STEP 7: STORE METADATA
-# ============================================================
-
-echo ""
-echo "=========================================================="
-echo "STEP 7: STORING METADATA"
-echo "=========================================================="
-
 METADATA_FILE="$TODAY_DIR/metadata.txt"
-
-cat <<EOF > "$METADATA_FILE"
+cat > "$METADATA_FILE" <<EOF
 Date: $TODAY
 Commit: $CURRENT_COMMIT
-
+Mode: $REVISION_MODE
 Raw Benchmark File: $RAW_BENCH
 Benchstat File: $BENCHSTAT_FILE
-
 Excel Report: $EXCEL_REPORT
 HTML Report: $HTML_REPORT
-
 Dashboard State: $STATE_FILE
 EOF
 
-echo ""
-echo "✅ Metadata stored"
+CURRENT_RAW="$RAW_BENCH"
+PREV_RAW=$(find "$RESULTS_DIR" -type f -name benchmark_raw.txt ! -path "$CURRENT_RAW" | sort | tail -1)
+HAS_PREVIOUS_RESULTS=false
+if [ -n "$PREV_RAW" ]; then
+    HAS_PREVIOUS_RESULTS=true
+fi
 
-# ============================================================
-# STEP 8: PIPELINE COMPLETE
-# ============================================================
+if [ "$HAS_PREVIOUS_RESULTS" = true ]; then
+    PREV_DIR=$(dirname "$PREV_RAW")
+    PREV_STATE="$PREV_DIR/dashboard_state.json"
+    BASELINE_DATE=$(basename "$PREV_DIR")
+    PREVIOUS_COMMIT=Unknown
+    PREV_METADATA="$PREV_DIR/metadata.txt"
+    if [ -f "$PREV_METADATA" ]; then
+        PREVIOUS_COMMIT=$(grep '^Commit:' "$PREV_METADATA" | head -1 | cut -d' ' -f2)
+    fi
+    if ! command -v benchstat >/dev/null 2>&1; then
+        go install golang.org/x/perf/cmd/benchstat@latest
+    fi
+    export PATH="$(go env GOPATH)/bin:$PATH"
+    benchstat -format=text "$PREV_RAW" "$RAW_BENCH" > "$BENCHSTAT_FILE"
+    python "$SCRIPT_DIR/generate_excel.py" "$BENCHSTAT_FILE" "$EXCEL_REPORT"
+    if [ -f "$PREV_STATE" ]; then
+        PREVIOUS_STATE_ARG="$PREV_STATE"
+    else
+        PREVIOUS_STATE_ARG=
+    fi
+    python "$SCRIPT_DIR/generate_dashboard.py" "$BENCHSTAT_FILE" "$HTML_REPORT" "$TODAY" "$BASELINE_DATE" "$CURRENT_COMMIT" "$PREVIOUS_COMMIT" "$STATE_FILE" "$PREVIOUS_STATE_ARG"
+else
+    echo "No previous benchmark result found; comparison reports were skipped."
+fi
 
 END_TIME=$(date +%s)
-TOTAL_TIME=$((END_TIME - START_TIME))
-
-echo ""
-echo "=========================================================="
-echo "✅ DAILY GO BENCHMARK PIPELINE COMPLETED"
-echo "=========================================================="
-
-echo ""
-echo "Artifacts Generated:"
-echo "----------------------------------------------------------"
-echo "Raw Benchmarks : $RAW_BENCH"
-echo "Benchstat      : $BENCHSTAT_FILE"
-echo "Excel Report   : $EXCEL_REPORT"
-echo "HTML Dashboard : $HTML_REPORT"
-echo "Metadata       : $METADATA_FILE"
-echo "DashboardState : $STATE_FILE"
-
-echo ""
-echo "Go Commit:"
-echo "$CURRENT_COMMIT"
-
-echo ""
-echo "Total Execution Time: ${TOTAL_TIME} seconds"
-
-echo ""
-echo "=========================================================="
-echo "🚀 PIPELINE FINISHED SUCCESSFULLY"
-echo "=========================================================="
-echo ""
+echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
+echo "Metadata: $METADATA_FILE"

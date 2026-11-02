@@ -66,83 +66,6 @@ usage() {
     echo "Without options, clone/update and benchmark the current master branch on-demand."
 }
 
-# Select the package manager available on the host.
-detect_package_manager() {
-    local manager
-    for manager in apt-get dnf yum pacman zypper brew; do
-        if command -v "$manager" >/dev/null 2>&1; then
-            PACKAGE_MANAGER=$manager
-            return 0
-        fi
-    done
-    echo "No supported package manager found (apt, dnf, yum, pacman, zypper, brew)." >&2
-    exit 1
-}
-
-# Resolve distro-specific package names.
-package_name() {
-    local package=$1
-    case "$PACKAGE_MANAGER:$package" in
-        apt-get:python) echo python3 ;;
-        apt-get:pip) echo python3-pip ;;
-        apt-get:venv) echo python3-venv ;;
-        apt-get:jpeg) echo libjpeg-dev ;;
-        apt-get:zlib) echo zlib1g-dev ;;
-        apt-get:taskset) echo util-linux ;;
-        dnf:python|yum:python) echo python3 ;;
-        dnf:pip|yum:pip) echo python3-pip ;;
-        dnf:venv|yum:venv) echo python3-virtualenv ;;
-        dnf:jpeg|yum:jpeg) echo libjpeg-turbo-devel ;;
-        dnf:zlib|yum:zlib) echo zlib-devel ;;
-        dnf:taskset|yum:taskset) echo util-linux ;;
-        pacman:python) echo python ;;
-        pacman:pip) echo python-pip ;;
-        pacman:venv) echo python-virtualenv ;;
-        pacman:jpeg) echo libjpeg-turbo ;;
-        pacman:zlib) echo zlib ;;
-        pacman:taskset) echo util-linux ;;
-        zypper:python) echo python3 ;;
-        zypper:pip) echo python3-pip ;;
-        zypper:venv) echo python3-virtualenv ;;
-        zypper:jpeg) echo libjpeg-turbo-devel ;;
-        zypper:zlib) echo zlib-devel ;;
-        zypper:taskset) echo util-linux ;;
-        brew:python) echo python ;;
-        brew:pip) echo python ;;
-        brew:venv) echo python ;;
-        brew:jpeg) echo jpeg ;;
-        brew:zlib) echo zlib ;;
-        brew:taskset) echo util-linux ;;
-        *) echo "$package" ;;
-    esac
-}
-
-# Install named logical packages through the detected package manager.
-install_packages() {
-    local package
-    local resolved=()
-    for package in "$@"; do
-        resolved+=("$(package_name "$package")")
-    done
-    case "$PACKAGE_MANAGER" in
-        apt-get) run_as_root apt-get update -y; run_as_root apt-get install -y "${resolved[@]}" ;;
-        dnf) run_as_root dnf install -y "${resolved[@]}" ;;
-        yum) run_as_root yum install -y "${resolved[@]}" ;;
-        pacman) run_as_root pacman -Sy --noconfirm "${resolved[@]}" ;;
-        zypper) run_as_root zypper --non-interactive install "${resolved[@]}" ;;
-        brew) brew install "${resolved[@]}" ;;
-    esac
-}
-
-# Run a command as root when the current user is not root.
-run_as_root() {
-    if [ "$(id -u)" -eq 0 ]; then
-        "$@"
-    else
-        command -v sudo >/dev/null 2>&1 || { echo "sudo is required to install system packages." >&2; exit 1; }
-        sudo "$@"
-    fi
-}
 
 # Check if we can safely edit crontab
 check_crontab_permission() {
@@ -209,18 +132,11 @@ check_prerequisites() {
     
     # 3. Required packages check
     local missing_pkgs=()
-    for cmd in git make gcc python3 pip3 taskset; do
+    for cmd in git make gcc taskset; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_pkgs+=("$cmd")
         fi
     done
-    if command -v python3 >/dev/null 2>&1; then
-        if ! python3 -c "import venv" >/dev/null 2>&1; then
-            missing_pkgs+=("python3-venv")
-        fi
-    else
-        missing_pkgs+=("python3-venv")
-    fi
     
     if [ ${#missing_pkgs[@]} -eq 0 ]; then
         log_content+="3. Required Packages Check: SUCCESS (All required packages are already installed)\n"
@@ -230,15 +146,28 @@ check_prerequisites() {
             log_content+="3. Required Packages Check: FAILED (Missing: ${missing_pkgs[*]}; cannot install without root/sudo)\n"
             status=1
         else
-            if detect_package_manager; then
-                if install_packages "${missing_pkgs[@]}" >> "$LOG_FILE" 2>&1; then
-                    log_content+="3. Required Packages Check: SUCCESS (Successfully installed: ${missing_pkgs[*]})\n"
+            # Resolve taskset to util-linux in Ubuntu, others match command name
+            local install_list=()
+            for item in "${missing_pkgs[@]}"; do
+                if [ "$item" = "taskset" ]; then
+                    install_list+=("util-linux")
                 else
-                    log_content+="3. Required Packages Check: FAILED (Failed to install: ${missing_pkgs[*]})\n"
-                    status=1
+                    install_list+=("$item")
                 fi
+            done
+            
+            local apt_success=true
+            if [ "$(id -u)" -eq 0 ]; then
+                apt-get update -y && apt-get install -y "${install_list[@]}" >> "$LOG_FILE" 2>&1 || apt_success=false
             else
-                log_content+="3. Required Packages Check: FAILED (No supported package manager found to install: ${missing_pkgs[*]})\n"
+                # shellcheck disable=SC2024
+                sudo apt-get update -y && sudo apt-get install -y "${install_list[@]}" >> "$LOG_FILE" 2>&1 || apt_success=false
+            fi
+            
+            if [ "$apt_success" = true ]; then
+                log_content+="3. Required Packages Check: SUCCESS (Successfully installed: ${missing_pkgs[*]})\n"
+            else
+                log_content+="3. Required Packages Check: FAILED (Failed to install: ${missing_pkgs[*]})\n"
                 status=1
             fi
         fi
@@ -547,19 +476,10 @@ fi
 
 # Set up files in $SCRIPT_DIR
 cp "$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh" "$SCRIPT_DIR/"
-cp "$SCRIPT_SOURCE_DIR/generate_dashboard.py" "$SCRIPT_DIR/"
-cp "$SCRIPT_SOURCE_DIR/generate_excel.py" "$SCRIPT_DIR/"
-cp "$SCRIPT_SOURCE_DIR/requirements.txt" "$SCRIPT_DIR/"
 if [ -f "$SCRIPT_SOURCE_DIR/.benchmark_config" ]; then
     cp "$SCRIPT_SOURCE_DIR/.benchmark_config" "$SCRIPT_DIR/"
 fi
 chmod 0755 "$SCRIPT_DIR/daily_go_benchmark_pipeline.sh"
-
-VENV_DIR="$BASE_DIR/.venv"
-python3 -m venv "$VENV_DIR"
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-python -m pip install --no-cache-dir -r "$SCRIPT_SOURCE_DIR/requirements.txt"
 
 run_suffix="${REVISION:-master}"
 run_suffix=$(echo "$run_suffix" | tr '/' '_')
@@ -620,9 +540,6 @@ fi
 
 # Metadata is written before comparison so it is preserved on a first run.
 BENCHSTAT_FILE="$TODAY_DIR/benchstat.txt"
-EXCEL_REPORT="$TODAY_DIR/report.xlsx"
-HTML_REPORT="$TODAY_DIR/report.html"
-STATE_FILE="$TODAY_DIR/dashboard_state.json"
 METADATA_FILE="$TODAY_DIR/metadata.txt"
 cat > "$METADATA_FILE" <<EOF
 Date: $TODAY
@@ -630,9 +547,6 @@ Commit: $CURRENT_COMMIT
 Mode: $REVISION_MODE
 Raw Benchmark File: $RAW_BENCH
 Benchstat File: $BENCHSTAT_FILE
-Excel Report: $EXCEL_REPORT
-HTML Report: $HTML_REPORT
-Dashboard State: $STATE_FILE
 EOF
 
 CURRENT_RAW="$RAW_BENCH"
@@ -643,27 +557,17 @@ if [ -n "$PREV_RAW" ]; then
 fi
 
 if [ "$HAS_PREVIOUS_RESULTS" = true ]; then
-    PREV_DIR=$(dirname "$PREV_RAW")
-    PREV_STATE="$PREV_DIR/dashboard_state.json"
-    BASELINE_DATE=$(basename "$PREV_DIR")
-    PREVIOUS_COMMIT=Unknown
-    PREV_METADATA="$PREV_DIR/metadata.txt"
-    if [ -f "$PREV_METADATA" ]; then
-        PREVIOUS_COMMIT=$(grep '^Commit:' "$PREV_METADATA" | head -1 | cut -d' ' -f2)
-    fi
     if ! command -v benchstat >/dev/null 2>&1; then
-        go install golang.org/x/perf/cmd/benchstat@latest
+        echo "Installing benchstat..."
+        go install golang.org/x/perf/cmd/benchstat@latest || true
     fi
-    GOPATH_BIN="$(go env GOPATH)/bin"
+    GOPATH_BIN="$(go env GOPATH 2>/dev/null || echo "$HOME/go")/bin"
     export PATH="$GOPATH_BIN:$PATH"
-    benchstat -format=text "$PREV_RAW" "$RAW_BENCH" > "$BENCHSTAT_FILE"
-    python "$SCRIPT_DIR/generate_excel.py" "$BENCHSTAT_FILE" "$EXCEL_REPORT"
-    if [ -f "$PREV_STATE" ]; then
-        PREVIOUS_STATE_ARG="$PREV_STATE"
+    if command -v benchstat >/dev/null 2>&1; then
+        benchstat -format=text "$PREV_RAW" "$RAW_BENCH" > "$BENCHSTAT_FILE"
     else
-        PREVIOUS_STATE_ARG=
+        echo "WARNING: benchstat is not available; raw comparison skipped."
     fi
-    python "$SCRIPT_DIR/generate_dashboard.py" "$BENCHSTAT_FILE" "$HTML_REPORT" "$TODAY" "$BASELINE_DATE" "$CURRENT_COMMIT" "$PREVIOUS_COMMIT" "$STATE_FILE" "$PREVIOUS_STATE_ARG"
 else
     echo "No previous benchmark result found; comparison reports were skipped."
 fi

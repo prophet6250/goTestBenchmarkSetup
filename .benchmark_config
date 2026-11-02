@@ -1,0 +1,7 @@
+# .benchmark_config
+# Developer email addresses (comma or space separated)
+DEV_EMAILS="dev-team@example.com"
+
+# Remote LPAR/zVM hosts for copying benchmark results and logs (space separated)
+# Format: user@hostname:path
+SCP_HOSTS="user@lpar1.example.com:/home/user/benchmarks user@lpar2.example.com:/home/user/benchmarks"

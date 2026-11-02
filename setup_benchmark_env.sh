@@ -8,7 +8,7 @@ INSTALL_ROOT=${INSTALL_ROOT:-/opt/gobenchmark}
 REPOSITORY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BENCHMARK_HOME="/home/$BENCHMARK_USER/benchmarkTests"
 SCRIPT_INSTALL_DIR="$INSTALL_ROOT/scripts"
-CRON_LINE="0 2 26-31 * * [ \"\$(date -d '+3 days' +\\%m)\" != \"\$(date +\\%m)\" ] && $SCRIPT_INSTALL_DIR/daily_go_benchmark_pipeline.sh"
+CRON_LINE="0 2 22-31 * * $SCRIPT_INSTALL_DIR/daily_go_benchmark_pipeline.sh --cron"
 
 # Verify the current user can perform privileged operations.
 check_root_access() {
@@ -126,6 +126,9 @@ install -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" -m 0755 "$REPOSITORY_DIR/daily
 install -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" -m 0644 "$REPOSITORY_DIR/generate_dashboard.py" "$SCRIPT_INSTALL_DIR/"
 install -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" -m 0644 "$REPOSITORY_DIR/generate_excel.py" "$SCRIPT_INSTALL_DIR/"
 install -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" -m 0644 "$REPOSITORY_DIR/requirements.txt" "$SCRIPT_INSTALL_DIR/"
+if [ -f "$REPOSITORY_DIR/.benchmark_config" ]; then
+    install -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" -m 0600 "$REPOSITORY_DIR/.benchmark_config" "$SCRIPT_INSTALL_DIR/"
+fi
 
 install -d -m 0750 -o "$BENCHMARK_USER" -g "$BENCHMARK_USER" "$BENCHMARK_HOME"
 chown -R "$BENCHMARK_USER:$BENCHMARK_USER" "$INSTALL_ROOT" "$BENCHMARK_HOME"

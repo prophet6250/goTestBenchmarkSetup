@@ -18,12 +18,18 @@ fi
 CPU_PIN_CORE="0"
 RUN_HISTORY_FILE="$BASE_DIR/logs/run_history.txt"
 
-# Send a mail using available system MTAs with optional attachment
+# Send a mail using available system MTAs with optional attachments (args 4..N)
 send_email() {
     local subject="$1"
     local body="$2"
     local recipient_list="$3"
-    local attachment_path="${4:-}"
+    local attachments=()
+    local f
+    for f in "${@:4}"; do
+        if [ -n "$f" ] && [ -f "$f" ]; then
+            attachments+=("$f")
+        fi
+    done
     
     # Normalize space-separated emails to comma-separated
     recipient_list=$(echo "$recipient_list" | tr ' ' ',')
@@ -35,18 +41,29 @@ send_email() {
     
     echo "Sending email: '$subject' to $recipient_list"
     
-    local mailx_opts=()
-    if [ -n "$attachment_path" ] && [ -f "$attachment_path" ]; then
-        mailx_opts=(-a "$attachment_path")
-        echo "Attaching file: $attachment_path"
+    # Attachment flag differs by implementation: GNU mailutils (Ubuntu/Debian) uses -A,
+    # while s-nail/bsd-mailx (RHEL and others) use -a (GNU's -a means "add header").
+    local mail_cmd=""
+    if command -v mailx >/dev/null 2>&1; then
+        mail_cmd="mailx"
+    elif command -v mail >/dev/null 2>&1; then
+        mail_cmd="mail"
     fi
     
-    if command -v mailx >/dev/null 2>&1; then
-        if echo -e "$body" | mailx "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
-            return 0
+    local mailx_opts=()
+    if [ "${#attachments[@]}" -gt 0 ] && [ -n "$mail_cmd" ]; then
+        local attach_flag="-a"
+        if "$mail_cmd" --version 2>&1 | grep -qi 'mailutils'; then
+            attach_flag="-A"
         fi
-    elif command -v mail >/dev/null 2>&1; then
-        if echo -e "$body" | mail "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
+        for f in "${attachments[@]}"; do
+            mailx_opts+=("$attach_flag" "$f")
+            echo "Attaching file: $f"
+        done
+    fi
+    
+    if [ -n "$mail_cmd" ]; then
+        if echo -e "$body" | "$mail_cmd" "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
             return 0
         fi
     elif command -v sendmail >/dev/null 2>&1; then
@@ -55,8 +72,8 @@ send_email() {
             echo "To: $recipient_list"
             echo ""
             echo -e "$body"
-            if [ -n "$attachment_path" ] && [ -f "$attachment_path" ]; then
-                echo "Note: sendmail does not natively support attachments. File saved at: $attachment_path"
+            if [ "${#attachments[@]}" -gt 0 ]; then
+                echo "Note: sendmail does not natively support attachments. Files saved at: ${attachments[*]}"
             fi
         ) | sendmail -t >/dev/null 2>&1; then
             return 0
@@ -360,9 +377,16 @@ should_run_cron_today() {
     return 1
 }
 
-# Copy the benchmark results archive to remote hosts
+# Copy the individual result files into a per-run directory on each remote host.
+# Usage: copy_results_to_hosts <run_dir_name> <file>...
 copy_results_to_hosts() {
-    local tar_path="$1"
+    local run_name="$1"
+    shift
+    local files=()
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] && files+=("$f")
+    done
     
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "WARNING: Configuration file $CONFIG_FILE is missing. Skipping results SCP copy."
@@ -391,9 +415,15 @@ copy_results_to_hosts() {
     hosts_list=$(echo "$SCP_HOSTS" | tr ',' ' ')
     
     for host in $hosts_list; do
-        echo "SCP'ing results tarball $tar_path to $host..."
-        local scp_err
-        if scp_err=$(scp -B -o ConnectTimeout=15 "$tar_path" "$host" 2>&1 >/dev/null); then
+        echo "SCP'ing ${#files[@]} result files to $host/$run_name ..."
+        local scp_err ssh_target remote_path
+        ssh_target="${host%%:*}"
+        remote_path="."
+        if [[ "$host" == *:* ]]; then
+            remote_path="${host#*:}"
+        fi
+        if scp_err=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$ssh_target" "mkdir -p '$remote_path/$run_name'" 2>&1 >/dev/null) \
+            && scp_err=$(scp -B -o ConnectTimeout=15 "${files[@]}" "$ssh_target:$remote_path/$run_name/" 2>&1 >/dev/null); then
             echo "Successfully copied to $host"
         else
             echo "FAILED to copy to $host"
@@ -412,7 +442,7 @@ copy_results_to_hosts() {
                 subject+="[TEST MODE] "
             fi
             subject+="Go Benchmark: SCP Copy Failure"
-            send_email "$subject" "The benchmark completed, but copying the results tarball ($tar_path) failed for: $failed_hosts_str." "$DEV_EMAILS"
+            send_email "$subject" "The benchmark completed, but copying the result files for $run_name failed for: $failed_hosts_str.\n\nscp error: ${scp_err:-unknown}" "$DEV_EMAILS" "$LOG_FILE"
         fi
         return 1
     fi
@@ -620,21 +650,15 @@ else
     echo "No previous benchmark result found; comparison reports were skipped."
 fi
 
-# Create TAR package
-tar_name="benchmark_results_${TODAY}_${run_suffix}.tar.gz"
-tar_file="${BASE_DIR}/results/${tar_name}"
-echo "Creating results TAR package $tar_file..."
-tar -czf "$tar_file" -C "$RESULTS_DIR" "${TODAY}_${run_suffix}" -C "$LOG_DIR" "$(basename "$LOG_FILE")"
-
-# SCP to remote hosts
-copy_results_to_hosts "$tar_file"
+# SCP individual result files to remote hosts (per-run directory)
+copy_results_to_hosts "${TODAY}_${run_suffix}" "$LOG_FILE" "$METADATA_FILE" "$BENCHSTAT_FILE" "$RAW_BENCH"
 
 END_TIME=$(date +%s)
 echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
 echo "Metadata: $METADATA_FILE"
 log_run_history "${CURRENT_COMMIT:-master}" "SUCCESS" "Benchmark completed successfully in $((END_TIME - START_TIME)) seconds."
 
-# Send success email to devs with results attachment
+# Send success email to devs with log, benchstat and metadata attached
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
@@ -645,6 +669,6 @@ if [ -f "$CONFIG_FILE" ]; then
         fi
         subject+="Go Benchmark Execution SUCCESS"
         body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.$(metadata_for_email)"
-        send_email "$subject" "$body" "$DEV_EMAILS" "$tar_file"
+        send_email "$subject" "$body" "$DEV_EMAILS" "$LOG_FILE" "$BENCHSTAT_FILE" "$METADATA_FILE"
     fi
 fi

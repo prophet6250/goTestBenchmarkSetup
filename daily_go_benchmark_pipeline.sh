@@ -433,6 +433,53 @@ should_run_cron_today() {
     return 1
 }
 
+# Copy the benchmark results archive to remote hosts
+copy_results_to_hosts() {
+    local tar_path="$1"
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "WARNING: Configuration file $CONFIG_FILE is missing. Skipping results SCP copy."
+        return 0
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    if [ -z "${SCP_HOSTS:-}" ] || [ -z "${SCP_HOSTS//[[:space:]]/}" ]; then
+        echo "WARNING: SCP hosts configuration (SCP_HOSTS) is missing. Skipping copy."
+        if [ -n "${DEV_EMAILS:-}" ]; then
+            send_email "Go Benchmark: SCP Hosts Missing" "The benchmark completed successfully, but SCP_HOSTS is missing from $CONFIG_FILE. Skipping copy." "$DEV_EMAILS"
+        fi
+        return 0
+    fi
+    
+    local scp_failed=false
+    local failed_hosts=()
+    local hosts_list
+    hosts_list=$(echo "$SCP_HOSTS" | tr ',' ' ')
+    
+    for host in $hosts_list; do
+        echo "SCP'ing results tarball $tar_path to $host..."
+        if scp -B -o ConnectTimeout=15 "$tar_path" "$host" >/dev/null 2>&1; then
+            echo "Successfully copied to $host"
+        else
+            echo "FAILED to copy to $host"
+            scp_failed=true
+            failed_hosts+=("$host")
+        fi
+    done
+    
+    if [ "$scp_failed" = true ]; then
+        local failed_hosts_str="${failed_hosts[*]}"
+        echo "ERROR: Failed to copy results to hosts: $failed_hosts_str"
+        if [ -n "${DEV_EMAILS:-}" ]; then
+            send_email "Go Benchmark: SCP Copy Failure" "The benchmark completed, but copying the results tarball ($tar_path) failed for: $failed_hosts_str." "$DEV_EMAILS"
+        fi
+        return 1
+    fi
+    
+    return 0
+}
+
 # Parse the explicitly requested revision, if any.
 parse_args() {
     REVISION_MODE=master
@@ -513,7 +560,9 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 python -m pip install --no-cache-dir -r "$SCRIPT_SOURCE_DIR/requirements.txt"
 
-TODAY_DIR="$RESULTS_DIR/$TODAY"
+local run_suffix="${REVISION:-master}"
+run_suffix=$(echo "$run_suffix" | tr '/' '_')
+TODAY_DIR="$RESULTS_DIR/${TODAY}_${run_suffix}"
 mkdir -p "$TODAY_DIR"
 START_TIME=$(date +%s)
 
@@ -608,6 +657,15 @@ if [ "$HAS_PREVIOUS_RESULTS" = true ]; then
 else
     echo "No previous benchmark result found; comparison reports were skipped."
 fi
+
+# Create TAR package
+local tar_name="benchmark_results_${TODAY}_${run_suffix}.tar.gz"
+local tar_file="${BASE_DIR}/results/${tar_name}"
+echo "Creating results TAR package $tar_file..."
+tar -czf "$tar_file" -C "$RESULTS_DIR" "${TODAY}_${run_suffix}" -C "$LOG_DIR" "$(basename "$LOG_FILE")"
+
+# SCP to remote hosts
+copy_results_to_hosts "$tar_file"
 
 END_TIME=$(date +%s)
 echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."

@@ -8,6 +8,51 @@ RESULTS_DIR="$BASE_DIR/results"
 LOG_DIR="$BASE_DIR/logs"
 SCRIPT_DIR="$BASE_DIR/scripts"
 TODAY=$(date +%F)
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+
+CONFIG_FILE="$SCRIPT_SOURCE_DIR/.benchmark_config"
+if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE="$SCRIPT_DIR/.benchmark_config"
+fi
+
+# Send a mail using available system MTAs
+send_email() {
+    local subject="$1"
+    local body="$2"
+    local recipient_list="$3"
+    
+    # Normalize space-separated emails to comma-separated
+    recipient_list=$(echo "$recipient_list" | tr ' ' ',')
+    
+    if [ -z "$recipient_list" ]; then
+        echo "No recipients provided for email: '$subject'"
+        return 1
+    fi
+    
+    echo "Sending email: '$subject' to $recipient_list"
+    
+    if command -v mailx >/dev/null 2>&1; then
+        if echo -e "$body" | mailx -s "$subject" "$recipient_list" >/dev/null 2>&1; then
+            return 0
+        fi
+    elif command -v mail >/dev/null 2>&1; then
+        if echo -e "$body" | mail -s "$subject" "$recipient_list" >/dev/null 2>&1; then
+            return 0
+        fi
+    elif command -v sendmail >/dev/null 2>&1; then
+        if (
+            echo "Subject: $subject"
+            echo "To: $recipient_list"
+            echo ""
+            echo -e "$body"
+        ) | sendmail -t >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    
+    echo "WARNING: Could not send email (no MTA configured or mail command failed)." >&2
+    return 1
+}
 
 usage() {
     echo "Usage: $0 [--tag TAG | --commit HASH]"

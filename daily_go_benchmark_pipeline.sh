@@ -16,6 +16,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 CPU_SIBLING_PAIR=""
+RUN_HISTORY_FILE="$BASE_DIR/logs/run_history.txt"
 
 # Send a mail using available system MTAs
 send_email() {
@@ -57,10 +58,11 @@ send_email() {
 }
 
 usage() {
-    echo "Usage: $0 [--tag TAG | --commit HASH]"
+    echo "Usage: $0 [--tag TAG | --commit HASH] [--cron]"
     echo ""
     echo "With --tag or --commit, build and benchmark the specified Go revision."
-    echo "Without either option, clone/update and benchmark the current master branch."
+    echo "With --cron, enforce the last Mon/Tue/Wed scheduling checks."
+    echo "Without options, clone/update and benchmark the current master branch on-demand."
 }
 
 # Select the package manager available on the host.
@@ -309,10 +311,133 @@ check_prerequisites() {
     return "$status"
 }
 
+# Logger helper for persistent history of each run
+log_run_history() {
+    local date_str commit_hash status msg
+    date_str=$(date '+%Y-%m-%d %H:%M:%S')
+    commit_hash="${1:-unknown}"
+    status="$2" # SUCCESS or FAILED
+    msg="$3"
+    echo "$date_str [$commit_hash] [$status] $msg" >> "$RUN_HISTORY_FILE"
+}
+
+# Add benchmark script to current user's crontab automatically if not root and not present
+ensure_cron_entry() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "Running as root user. Skipping crontab automatic addition."
+        return 0
+    fi
+    
+    local script_path="$SCRIPT_DIR/daily_go_benchmark_pipeline.sh"
+    if [ ! -f "$script_path" ]; then
+        script_path="$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh"
+    fi
+    
+    local cron_cmd="0 2 22-31 * * $script_path --cron"
+    local existing
+    existing=$(crontab -l 2>/dev/null || true)
+    
+    if printf '%s\n' "$existing" | grep -Fqx "$cron_cmd"; then
+        return 0
+    fi
+    
+    echo "Adding benchmark script to crontab..."
+    { printf '%s\n' "$existing"; printf '%s\n' "$cron_cmd"; } | crontab -
+    echo "Crontab entry added successfully."
+}
+
+# Determine the last Mon, Tue, Wed of the current month
+get_last_mon_tue_wed() {
+    local y m last_day
+    y=$(date +%Y)
+    m=$(date +%m)
+    
+    if date -d "today" >/dev/null 2>&1; then
+        last_day=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%d)
+    else
+        last_day=$(date -v1d -v+1m -v-1d +%d)
+    fi
+    
+    LAST_MON=""
+    LAST_TUE=""
+    LAST_WED=""
+    
+    for ((d=last_day; d>=last_day-6; d--)); do
+        local dow
+        if date -d "today" >/dev/null 2>&1; then
+            dow=$(date -d "$y-$m-$d" +%u 2>/dev/null || true)
+        else
+            dow=$(date -j -f "%Y-%m-%d" "$y-$m-$d" +%u 2>/dev/null || true)
+        fi
+        
+        if [ "$dow" = "1" ] && [ -z "$LAST_MON" ]; then
+            LAST_MON=$d
+        elif [ "$dow" = "2" ] && [ -z "$LAST_TUE" ]; then
+            LAST_TUE=$d
+        elif [ "$dow" = "3" ] && [ -z "$LAST_WED" ]; then
+            LAST_WED=$d
+        fi
+    done
+}
+
+# Cron scheduled run checks (earliest of last Mon, Tue, Wed precedence)
+should_run_cron_today() {
+    get_last_mon_tue_wed
+    
+    local today_day today_dow current_month
+    today_day=$(date +%e | tr -d '[:space:]')
+    today_dow=$(date +%u) # 1=Mon, 2=Tue, 3=Wed
+    current_month=$(date +%Y-%m)
+    
+    local is_target_day=false
+    if [ "$today_dow" = "1" ] && [ "$today_day" = "$LAST_MON" ]; then
+        is_target_day=true
+    elif [ "$today_dow" = "2" ] && [ "$today_day" = "$LAST_TUE" ]; then
+        is_target_day=true
+    elif [ "$today_dow" = "3" ] && [ "$today_day" = "$LAST_WED" ]; then
+        is_target_day=true
+    fi
+    
+    if [ "$is_target_day" = false ]; then
+        echo "Today is not the last Monday, Tuesday, or Wednesday of the month. Skipping scheduled run."
+        return 1
+    fi
+    
+    # Check if a successful run already happened this month
+    local has_run_this_month=false
+    if [ -f "$RUN_HISTORY_FILE" ]; then
+        if grep -q "^$current_month-.*SUCCESS" "$RUN_HISTORY_FILE"; then
+            has_run_this_month=true
+        fi
+    fi
+    
+    if [ "$has_run_this_month" = true ]; then
+        echo "Benchmark has already run successfully this month. Skipping run."
+        return 1
+    fi
+    
+    # Precedence logic: Mon -> Tue -> Wed
+    if [ "$today_dow" = "1" ]; then
+        echo "Today is last Monday of the month. Proceeding with run."
+        return 0
+    fi
+    if [ "$today_dow" = "2" ]; then
+        echo "Today is last Tuesday of the month, and no successful run recorded yet. Proceeding with run."
+        return 0
+    fi
+    if [ "$today_dow" = "3" ]; then
+        echo "Today is last Wednesday of the month, and no successful run recorded yet. Proceeding with run."
+        return 0
+    fi
+    
+    return 1
+}
+
 # Parse the explicitly requested revision, if any.
 parse_args() {
     REVISION_MODE=master
     REVISION=
+    CRON_MODE=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --tag|--commit)
@@ -322,6 +447,10 @@ parse_args() {
                 REVISION=$2
                 shift 2
                 ;;
+            --cron)
+                CRON_MODE=true
+                shift
+                ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
         esac
@@ -330,14 +459,41 @@ parse_args() {
 
 parse_args "$@"
 
+# If running via cron, check if today is the correct day
+if [ "$CRON_MODE" = true ]; then
+    if ! should_run_cron_today; then
+        exit 0
+    fi
+fi
+
+# Auto-ensure cron entry for future schedules
+ensure_cron_entry
+
 # Initialize Log File with Timestamp early
 mkdir -p "$BASE_DIR" "$RESULTS_DIR" "$LOG_DIR" "$SCRIPT_DIR"
 LOG_FILE="$LOG_DIR/daily_pipeline_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+# Error handler for unexpected execution failures
+handle_error() {
+    local exit_code=$?
+    echo "ERROR: Pipeline failed on line $1 with exit code $exit_code" >&2
+    log_run_history "${CURRENT_COMMIT:-${REVISION:-master}}" "FAILED" "Execution failed on line $1 with exit code $exit_code"
+    
+    # Send email on failure
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        if [ -n "${DEV_EMAILS:-}" ]; then
+            send_email "Go Benchmark: Benchmark Execution FAILED" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details." "${DEV_EMAILS:-}"
+        fi
+    fi
+}
+trap 'handle_error $LINENO' ERR
+
 # Run prerequisites check
 if ! check_prerequisites; then
     echo "ERROR: Pre-requisites check failed. Exiting." >&2
+    log_run_history "${REVISION:-master}" "FAILED" "Prerequisite checks failed."
     exit 1
 fi
 
@@ -456,3 +612,4 @@ fi
 END_TIME=$(date +%s)
 echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
 echo "Metadata: $METADATA_FILE"
+log_run_history "${CURRENT_COMMIT:-master}" "SUCCESS" "Benchmark completed successfully in $((END_TIME - START_TIME)) seconds."

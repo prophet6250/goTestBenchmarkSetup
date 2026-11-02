@@ -41,41 +41,48 @@ send_email() {
     
     echo "Sending email: '$subject' to $recipient_list"
     
-    # Attachment flag differs by implementation: GNU mailutils (Ubuntu/Debian) uses -A,
-    # while s-nail/bsd-mailx (RHEL and others) use -a (GNU's -a means "add header").
-    local mail_cmd=""
-    if command -v mailx >/dev/null 2>&1; then
-        mail_cmd="mailx"
-    elif command -v mail >/dev/null 2>&1; then
-        mail_cmd="mail"
+    # Build the MIME message ourselves and hand it to sendmail (Postfix/Exim/etc.).
+    # This avoids mail/mailx differences (-a vs -A) between s-nail, bsd-mailx and GNU mailutils.
+    local sendmail_cmd=""
+    if command -v sendmail >/dev/null 2>&1; then
+        sendmail_cmd="sendmail"
+    elif [ -x /usr/sbin/sendmail ]; then
+        sendmail_cmd="/usr/sbin/sendmail"
     fi
-    
-    local mailx_opts=()
-    if [ "${#attachments[@]}" -gt 0 ] && [ -n "$mail_cmd" ]; then
-        local attach_flag="-a"
-        if "$mail_cmd" --version 2>&1 | grep -qi 'mailutils'; then
-            attach_flag="-A"
-        fi
-        for f in "${attachments[@]}"; do
-            mailx_opts+=("$attach_flag" "$f")
-            echo "Attaching file: $f"
-        done
-    fi
-    
-    if [ -n "$mail_cmd" ]; then
-        if echo -e "$body" | "$mail_cmd" "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
-            return 0
-        fi
-    elif command -v sendmail >/dev/null 2>&1; then
-        if (
-            echo "Subject: $subject"
+
+    if [ -n "$sendmail_cmd" ]; then
+        local boundary
+        boundary="=_bench_$(date +%s)_$$"
+        local rc=0
+        {
             echo "To: $recipient_list"
+            echo "Subject: $subject"
+            echo "MIME-Version: 1.0"
+            echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
+            echo ""
+            echo "--$boundary"
+            echo "Content-Type: text/plain; charset=UTF-8"
+            echo "Content-Transfer-Encoding: 8bit"
             echo ""
             echo -e "$body"
-            if [ "${#attachments[@]}" -gt 0 ]; then
-                echo "Note: sendmail does not natively support attachments. Files saved at: ${attachments[*]}"
-            fi
-        ) | sendmail -t >/dev/null 2>&1; then
+            for f in "${attachments[@]}"; do
+                echo "Attaching file: $f" >&2
+                echo "--$boundary"
+                echo "Content-Type: text/plain; charset=UTF-8; name=\"$(basename "$f").txt\""
+                echo "Content-Transfer-Encoding: base64"
+                echo "Content-Disposition: attachment; filename=\"$(basename "$f").txt\""
+                echo ""
+                base64 < "$f"
+            done
+            echo "--$boundary--"
+        } | "$sendmail_cmd" -t >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+    elif command -v mailx >/dev/null 2>&1 || command -v mail >/dev/null 2>&1; then
+        local mail_cmd="mailx"
+        command -v mailx >/dev/null 2>&1 || mail_cmd="mail"
+        if echo -e "$body" | "$mail_cmd" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
             return 0
         fi
     fi

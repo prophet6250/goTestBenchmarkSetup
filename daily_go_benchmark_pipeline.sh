@@ -294,6 +294,7 @@ check_prerequisites() {
     
     # Send email with pre-requisite results
     if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
         source "$CONFIG_FILE"
         if [ -n "${DEV_EMAILS:-}" ]; then
             local subject="Go Benchmark Pre-requisites: "
@@ -442,6 +443,7 @@ copy_results_to_hosts() {
         return 0
     fi
     
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
     
     if [ -z "${SCP_HOSTS:-}" ] || [ -z "${SCP_HOSTS//[[:space:]]/}" ]; then
@@ -529,6 +531,7 @@ handle_error() {
     
     # Send email on failure
     if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
         source "$CONFIG_FILE"
         if [ -n "${DEV_EMAILS:-}" ]; then
             send_email "Go Benchmark: Benchmark Execution FAILED" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details." "${DEV_EMAILS:-}"
@@ -560,7 +563,7 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 python -m pip install --no-cache-dir -r "$SCRIPT_SOURCE_DIR/requirements.txt"
 
-local run_suffix="${REVISION:-master}"
+run_suffix="${REVISION:-master}"
 run_suffix=$(echo "$run_suffix" | tr '/' '_')
 TODAY_DIR="$RESULTS_DIR/${TODAY}_${run_suffix}"
 mkdir -p "$TODAY_DIR"
@@ -645,7 +648,8 @@ if [ "$HAS_PREVIOUS_RESULTS" = true ]; then
     if ! command -v benchstat >/dev/null 2>&1; then
         go install golang.org/x/perf/cmd/benchstat@latest
     fi
-    export PATH="$(go env GOPATH)/bin:$PATH"
+    GOPATH_BIN="$(go env GOPATH)/bin"
+    export PATH="$GOPATH_BIN:$PATH"
     benchstat -format=text "$PREV_RAW" "$RAW_BENCH" > "$BENCHSTAT_FILE"
     python "$SCRIPT_DIR/generate_excel.py" "$BENCHSTAT_FILE" "$EXCEL_REPORT"
     if [ -f "$PREV_STATE" ]; then
@@ -659,8 +663,8 @@ else
 fi
 
 # Create TAR package
-local tar_name="benchmark_results_${TODAY}_${run_suffix}.tar.gz"
-local tar_file="${BASE_DIR}/results/${tar_name}"
+tar_name="benchmark_results_${TODAY}_${run_suffix}.tar.gz"
+tar_file="${BASE_DIR}/results/${tar_name}"
 echo "Creating results TAR package $tar_file..."
 tar -czf "$tar_file" -C "$RESULTS_DIR" "${TODAY}_${run_suffix}" -C "$LOG_DIR" "$(basename "$LOG_FILE")"
 

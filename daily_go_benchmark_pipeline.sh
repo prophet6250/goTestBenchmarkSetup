@@ -383,10 +383,12 @@ copy_results_to_hosts() {
     
     for host in $hosts_list; do
         echo "SCP'ing results tarball $tar_path to $host..."
-        if scp -B -o ConnectTimeout=15 "$tar_path" "$host" >/dev/null 2>&1; then
+        local scp_err
+        if scp_err=$(scp -B -o ConnectTimeout=15 "$tar_path" "$host" 2>&1 >/dev/null); then
             echo "Successfully copied to $host"
         else
             echo "FAILED to copy to $host"
+            echo "scp error: $scp_err"
             scp_failed=true
             failed_hosts+=("$host")
         fi
@@ -447,13 +449,22 @@ if [ "$CRON_MODE" = true ]; then
     fi
 fi
 
-# Auto-ensure cron entry for future schedules
-ensure_cron_entry
+# Auto-ensure cron entry for future schedules (not in test mode)
+if [ "$TEST_MODE" != true ]; then
+    ensure_cron_entry
+fi
 
 # Initialize Log File with Timestamp early
 mkdir -p "$BASE_DIR" "$RESULTS_DIR" "$LOG_DIR" "$SCRIPT_DIR"
 LOG_FILE="$LOG_DIR/daily_pipeline_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Metadata block appended to emails (empty if the run failed before metadata was written)
+metadata_for_email() {
+    if [ -n "${METADATA_FILE:-}" ] && [ -f "$METADATA_FILE" ]; then
+        printf '\n\nMetadata:\n%s' "$(cat "$METADATA_FILE")"
+    fi
+}
 
 # Error handler for unexpected execution failures
 handle_error() {
@@ -471,7 +482,7 @@ handle_error() {
                 subject+="[TEST MODE] "
             fi
             subject+="Go Benchmark: Benchmark Execution FAILED"
-            send_email "$subject" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details." "${DEV_EMAILS:-}"
+            send_email "$subject" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details.$(metadata_for_email)" "${DEV_EMAILS:-}"
         fi
     fi
 }
@@ -501,7 +512,7 @@ if [ ! -d "$GO_DIR/.git" ]; then
     clone_attempt=1
     while ! git clone https://go.googlesource.com/go "$GO_DIR" --recursive; do
         echo "Go repository clone attempt $clone_attempt failed."
-        [ "$clone_attempt" -lt 2 ] || { echo "Unable to clone the Go repository after 2 attempts." >&2; exit 1; }
+        [ "$clone_attempt" -lt 2 ] || { echo "Unable to clone the Go repository after 2 attempts." >&2; false; }
         clone_attempt=$((clone_attempt + 1))
         sleep 5
     done
@@ -518,13 +529,27 @@ else
 fi
 CURRENT_COMMIT=$(git rev-parse HEAD)
 
+# Metadata is written before the build/benchmark so failure emails can include it.
+RAW_BENCH="$TODAY_DIR/benchmark_raw.txt"
+BENCHSTAT_FILE="$TODAY_DIR/benchstat.txt"
+METADATA_FILE="$TODAY_DIR/metadata.txt"
+rm -f "$TODAY_DIR/.complete"
+cat > "$METADATA_FILE" <<EOF
+Date: $TODAY
+Timestamp: $TIMESTAMP
+Commit: $CURRENT_COMMIT
+Mode: $REVISION_MODE
+Test Mode: ${TEST_MODE:-false}
+Raw Benchmark File: $RAW_BENCH
+Benchstat File: $BENCHSTAT_FILE
+EOF
+
+# NOTE: 'false' (rather than 'exit 1') is used below so the ERR trap sends the failure email.
 cd "$GO_DIR/src"
 if ! ./make.bash; then
     echo "Go toolchain build failed." >&2
-    exit 1
+    false
 fi
-
-RAW_BENCH="$TODAY_DIR/benchmark_raw.txt"
 
 bench_target="./..."
 bench_count=6
@@ -538,29 +563,33 @@ if [ -n "$CPU_PIN_CORE" ]; then
     echo "Running pinned to logical CPU core: $CPU_PIN_CORE"
     if ! taskset -c "$CPU_PIN_CORE" "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
         echo "Benchmark execution failed." >&2
-        exit 1
+        false
     fi
 else
     echo "Running unpinned (single CPU)..."
     if ! "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
         echo "Benchmark execution failed." >&2
-        exit 1
+        false
     fi
 fi
 
-# Metadata is written before comparison so it is preserved on a first run.
-BENCHSTAT_FILE="$TODAY_DIR/benchstat.txt"
-METADATA_FILE="$TODAY_DIR/metadata.txt"
-cat > "$METADATA_FILE" <<EOF
-Date: $TODAY
-Commit: $CURRENT_COMMIT
-Mode: $REVISION_MODE
-Raw Benchmark File: $RAW_BENCH
-Benchstat File: $BENCHSTAT_FILE
-EOF
+# Marks this run's raw results as complete so later runs can use them as a baseline.
+touch "$TODAY_DIR/.complete"
 
+# Previous baseline: the most recently finished run (by metadata.txt mtime) that
+# completed successfully and has the same test-mode setting as this run.
 CURRENT_RAW="$RAW_BENCH"
-PREV_RAW=$(find "$RESULTS_DIR" -type f -name benchmark_raw.txt ! -path "$CURRENT_RAW" | sort | tail -1)
+PREV_RAW=""
+for meta in $(ls -1t "$RESULTS_DIR"/*/metadata.txt 2>/dev/null || true); do
+    prev_dir=$(dirname "$meta")
+    [ -f "$prev_dir/.complete" ] && [ -f "$prev_dir/benchmark_raw.txt" ] || continue
+    [ "$prev_dir/benchmark_raw.txt" != "$CURRENT_RAW" ] || continue
+    if grep -qx 'Test Mode: true' "$meta"; then prev_test=true; else prev_test=false; fi
+    [ "$prev_test" = "${TEST_MODE:-false}" ] || continue
+    PREV_RAW="$prev_dir/benchmark_raw.txt"
+    break
+done
+echo "Previous benchmark baseline: ${PREV_RAW:-none}"
 HAS_PREVIOUS_RESULTS=false
 if [ -n "$PREV_RAW" ]; then
     HAS_PREVIOUS_RESULTS=true
@@ -606,7 +635,7 @@ if [ -f "$CONFIG_FILE" ]; then
             subject+="[TEST MODE] "
         fi
         subject+="Go Benchmark Execution SUCCESS"
-        body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.\n\nMetadata: $METADATA_FILE"
+        body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.$(metadata_for_email)"
         send_email "$subject" "$body" "$DEV_EMAILS" "$tar_file"
     fi
 fi

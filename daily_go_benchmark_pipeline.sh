@@ -18,11 +18,12 @@ fi
 CPU_PIN_CORE="0"
 RUN_HISTORY_FILE="$BASE_DIR/logs/run_history.txt"
 
-# Send a mail using available system MTAs
+# Send a mail using available system MTAs with optional attachment
 send_email() {
     local subject="$1"
     local body="$2"
     local recipient_list="$3"
+    local attachment_path="${4:-}"
     
     # Normalize space-separated emails to comma-separated
     recipient_list=$(echo "$recipient_list" | tr ' ' ',')
@@ -34,12 +35,18 @@ send_email() {
     
     echo "Sending email: '$subject' to $recipient_list"
     
+    local mailx_opts=()
+    if [ -n "$attachment_path" ] && [ -f "$attachment_path" ]; then
+        mailx_opts=(-a "$attachment_path")
+        echo "Attaching file: $attachment_path"
+    fi
+    
     if command -v mailx >/dev/null 2>&1; then
-        if echo -e "$body" | mailx -s "$subject" "$recipient_list" >/dev/null 2>&1; then
+        if echo -e "$body" | mailx "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
             return 0
         fi
     elif command -v mail >/dev/null 2>&1; then
-        if echo -e "$body" | mail -s "$subject" "$recipient_list" >/dev/null 2>&1; then
+        if echo -e "$body" | mail "${mailx_opts[@]}" -s "$subject" "$recipient_list" >/dev/null 2>&1; then
             return 0
         fi
     elif command -v sendmail >/dev/null 2>&1; then
@@ -48,6 +55,9 @@ send_email() {
             echo "To: $recipient_list"
             echo ""
             echo -e "$body"
+            if [ -n "$attachment_path" ] && [ -f "$attachment_path" ]; then
+                echo "Note: sendmail does not natively support attachments. File saved at: $attachment_path"
+            fi
         ) | sendmail -t >/dev/null 2>&1; then
             return 0
         fi
@@ -586,7 +596,7 @@ echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
 echo "Metadata: $METADATA_FILE"
 log_run_history "${CURRENT_COMMIT:-master}" "SUCCESS" "Benchmark completed successfully in $((END_TIME - START_TIME)) seconds."
 
-# Send success email to devs
+# Send success email to devs with results attachment
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
@@ -597,6 +607,6 @@ if [ -f "$CONFIG_FILE" ]; then
         fi
         subject+="Go Benchmark Execution SUCCESS"
         body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.\n\nMetadata: $METADATA_FILE"
-        send_email "$subject" "$body" "$DEV_EMAILS"
+        send_email "$subject" "$body" "$DEV_EMAILS" "$tar_file"
     fi
 fi

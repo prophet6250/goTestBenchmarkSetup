@@ -15,7 +15,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     CONFIG_FILE="$SCRIPT_DIR/.benchmark_config"
 fi
 
-CPU_SIBLING_PAIR=""
+CPU_PIN_CORE="0"
 RUN_HISTORY_FILE="$BASE_DIR/logs/run_history.txt"
 
 # Send a mail using available system MTAs
@@ -144,29 +144,6 @@ run_as_root() {
     fi
 }
 
-# Find the first pair of logical CPUs listed as siblings by sysfs.
-find_sibling_pair() {
-    local topology list first second start
-    for topology in /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list; do
-        [ -r "$topology" ] || continue
-        list=$(tr -d '[:space:]' < "$topology")
-        if [[ "$list" == *,* ]]; then
-            first=${list%%,*}
-            second=${list#*,}
-        elif [[ "$list" == *-* ]]; then
-            start=${list%%-*}
-            first=$start
-            second=$((start + 1))
-        else
-            continue
-        fi
-        [ "$first" != "$second" ] || continue
-        CPU_SIBLING_PAIR="$first,$second"
-        return 0
-    done
-    return 1
-}
-
 # Check if we can safely edit crontab
 check_crontab_permission() {
     local tmp_cron
@@ -198,18 +175,14 @@ check_prerequisites() {
     log_content+="Timestamp: $(date '+%Y-%m-%d %H:%M:%S')\n"
     log_content+="Log File: $LOG_FILE\n\n"
     
-    # 1. CPU Sibling check (skip if single IFL/core)
+    # 1. CPU Pinning Check (skip if single core/IFL)
     local num_cpus
     num_cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
     if [ "$num_cpus" -eq 1 ]; then
         log_content+="1. CPU Pinning Check: SKIPPED (Single core/IFL/logical CPU detected)\n"
+        CPU_PIN_CORE=""
     else
-        if find_sibling_pair; then
-            log_content+="1. CPU Pinning Check: SUCCESS (CPU Sibling pair: $CPU_SIBLING_PAIR)\n"
-        else
-            log_content+="1. CPU Pinning Check: FAILED (No adjacent logical CPU sibling pair found for CPU pinning)\n"
-            status=1
-        fi
+        log_content+="1. CPU Pinning Check: SUCCESS (Pinning workloads to core: $CPU_PIN_CORE)\n"
     fi
     
     # 2. Sudo user for taskset installation
@@ -631,9 +604,9 @@ if [ "${TEST_MODE:-false}" = true ]; then
     echo "[TEST MODE] Running on single package '$bench_target' with 1 iteration."
 fi
 
-if [ -n "$CPU_SIBLING_PAIR" ]; then
-    echo "Running pinned to logical CPU sibling pair: $CPU_SIBLING_PAIR"
-    if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
+if [ -n "$CPU_PIN_CORE" ]; then
+    echo "Running pinned to logical CPU core: $CPU_PIN_CORE"
+    if ! taskset -c "$CPU_PIN_CORE" "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
         echo "Benchmark execution failed." >&2
         exit 1
     fi

@@ -231,12 +231,20 @@ check_prerequisites() {
 
 # Logger helper for persistent history of each run
 log_run_history() {
-    local date_str commit_hash status msg
+    local date_str commit_hash status msg run_type
     date_str=$(date '+%Y-%m-%d %H:%M:%S')
     commit_hash="${1:-unknown}"
     status="$2" # SUCCESS or FAILED
     msg="$3"
-    echo "$date_str [$commit_hash] [$status] $msg" >> "$RUN_HISTORY_FILE"
+    # Run type: test, cron (scheduled) or manual. Only cron runs satisfy the monthly schedule.
+    if [ "${TEST_MODE:-false}" = true ]; then
+        run_type="test"
+    elif [ "${CRON_MODE:-false}" = true ]; then
+        run_type=cron
+    else
+        run_type=manual
+    fi
+    echo "$date_str [$commit_hash] [$status] [$run_type] $msg" >> "$RUN_HISTORY_FILE"
 }
 
 # Add benchmark script to current user's crontab automatically if not root and not present
@@ -321,10 +329,11 @@ should_run_cron_today() {
         return 1
     fi
     
-    # Check if a successful run already happened this month
+    # Check if a successful scheduled (cron) run already happened this month.
+    # Manual and test runs, and legacy entries without a run type, do not count.
     local has_run_this_month=false
     if [ -f "$RUN_HISTORY_FILE" ]; then
-        if grep -q "^$current_month-.*SUCCESS" "$RUN_HISTORY_FILE"; then
+        if grep -q "^$current_month-.*\[SUCCESS\] \[cron\]" "$RUN_HISTORY_FILE"; then
             has_run_this_month=true
         fi
     fi

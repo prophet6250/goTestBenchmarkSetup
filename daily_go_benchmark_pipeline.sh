@@ -15,6 +15,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
     CONFIG_FILE="$SCRIPT_DIR/.benchmark_config"
 fi
 
+CPU_SIBLING_PAIR=""
+
 # Send a mail using available system MTAs
 send_email() {
     local subject="$1"
@@ -162,6 +164,151 @@ find_sibling_pair() {
     return 1
 }
 
+# Check if we can safely edit crontab
+check_crontab_permission() {
+    local tmp_cron
+    tmp_cron=$(mktemp 2>/dev/null || echo "/tmp/cron_test_$$")
+    if crontab -l > "$tmp_cron" 2>/dev/null; then
+        if crontab "$tmp_cron" 2>/dev/null; then
+            rm -f "$tmp_cron"
+            return 0
+        else
+            rm -f "$tmp_cron"
+            return 1
+        fi
+    else
+        # No crontab exists yet, try writing a test line and then removing it
+        if echo "# test" | crontab - 2>/dev/null; then
+            crontab -r 2>/dev/null || true
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+# Check all pre-requisites
+check_prerequisites() {
+    local status=0
+    local log_content=""
+    log_content+="--- Go Benchmark Pre-requisite Check ---\n"
+    log_content+="Timestamp: $(date '+%Y-%m-%d %H:%M:%S')\n"
+    log_content+="Log File: $LOG_FILE\n\n"
+    
+    # 1. CPU Sibling check (skip if single IFL/core)
+    local num_cpus
+    num_cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    if [ "$num_cpus" -eq 1 ]; then
+        log_content+="1. CPU Pinning Check: SKIPPED (Single core/IFL/logical CPU detected)\n"
+    else
+        if find_sibling_pair; then
+            log_content+="1. CPU Pinning Check: SUCCESS (CPU Sibling pair: $CPU_SIBLING_PAIR)\n"
+        else
+            log_content+="1. CPU Pinning Check: FAILED (No adjacent logical CPU sibling pair found for CPU pinning)\n"
+            status=1
+        fi
+    fi
+    
+    # 2. Sudo user for taskset installation
+    local has_taskset=false
+    if command -v taskset >/dev/null 2>&1; then
+        has_taskset=true
+    fi
+    
+    local has_sudo=false
+    if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
+        has_sudo=true
+    fi
+    
+    if [ "$has_taskset" = true ]; then
+        log_content+="2. Taskset Sudo Check: SUCCESS (taskset already installed)\n"
+    else
+        if [ "$has_sudo" = true ]; then
+            log_content+="2. Taskset Sudo Check: SUCCESS (taskset not installed, but passwordless sudo is available)\n"
+        else
+            log_content+="2. Taskset Sudo Check: FAILED (taskset is NOT installed, and passwordless sudo is NOT available)\n"
+            status=1
+        fi
+    fi
+    
+    # 3. Required packages check
+    local missing_pkgs=()
+    for cmd in git make gcc python3 pip3 taskset; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_pkgs+=("$cmd")
+        fi
+    done
+    if command -v python3 >/dev/null 2>&1; then
+        if ! python3 -c "import venv" >/dev/null 2>&1; then
+            missing_pkgs+=("python3-venv")
+        fi
+    else
+        missing_pkgs+=("python3-venv")
+    fi
+    
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        log_content+="3. Required Packages Check: SUCCESS (All required packages are already installed)\n"
+    else
+        log_content+="3. Required Packages Check: PENDING (Missing: ${missing_pkgs[*]}). Attempting installation...\n"
+        if [ "$has_sudo" = false ] && [ "$(id -u)" -ne 0 ]; then
+            log_content+="3. Required Packages Check: FAILED (Missing: ${missing_pkgs[*]}; cannot install without root/sudo)\n"
+            status=1
+        else
+            if detect_package_manager; then
+                if install_packages "${missing_pkgs[@]}" >> "$LOG_FILE" 2>&1; then
+                    log_content+="3. Required Packages Check: SUCCESS (Successfully installed: ${missing_pkgs[*]})\n"
+                else
+                    log_content+="3. Required Packages Check: FAILED (Failed to install: ${missing_pkgs[*]})\n"
+                    status=1
+                fi
+            else
+                log_content+="3. Required Packages Check: FAILED (No supported package manager found to install: ${missing_pkgs[*]})\n"
+                status=1
+            fi
+        fi
+    fi
+    
+    # 4. Crontab check (skip if root user)
+    if [ "$(id -u)" -eq 0 ]; then
+        log_content+="4. Crontab Edit Check: SKIPPED (Running as root user)\n"
+    else
+        if check_crontab_permission; then
+            log_content+="4. Crontab Edit Check: SUCCESS (Able to edit crontab)\n"
+        else
+            log_content+="4. Crontab Edit Check: FAILED (Permission denied/unable to edit crontab)\n"
+            status=1
+        fi
+    fi
+    
+    log_content+="\n---------------------------------------\n"
+    if [ "$status" -eq 0 ]; then
+        log_content+="Overall Pre-requisites: SUCCESS\n"
+    else
+        log_content+="Overall Pre-requisites: FAILED\n"
+    fi
+    
+    # Print results to stdout/logfile
+    printf "%b" "$log_content"
+    
+    # Send email with pre-requisite results
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        if [ -n "${DEV_EMAILS:-}" ]; then
+            local subject="Go Benchmark Pre-requisites: "
+            if [ "$status" -eq 0 ]; then
+                subject+="SUCCESS"
+            else
+                subject+="FAILED"
+            fi
+            send_email "$subject" "$(printf "%b" "$log_content")" "$DEV_EMAILS"
+        fi
+    else
+        echo "WARNING: Configuration file $CONFIG_FILE not found. Cannot send pre-requisite email to devs."
+    fi
+    
+    return "$status"
+}
+
 # Parse the explicitly requested revision, if any.
 parse_args() {
     REVISION_MODE=master
@@ -182,14 +329,26 @@ parse_args() {
 }
 
 parse_args "$@"
-detect_package_manager
-install_packages git make gcc python pip venv jpeg zlib taskset
 
+# Initialize Log File with Timestamp early
 mkdir -p "$BASE_DIR" "$RESULTS_DIR" "$LOG_DIR" "$SCRIPT_DIR"
+LOG_FILE="$LOG_DIR/daily_pipeline_${TIMESTAMP}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Run prerequisites check
+if ! check_prerequisites; then
+    echo "ERROR: Pre-requisites check failed. Exiting." >&2
+    exit 1
+fi
+
+# Set up files in $SCRIPT_DIR
 cp "$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh" "$SCRIPT_DIR/"
 cp "$SCRIPT_SOURCE_DIR/generate_dashboard.py" "$SCRIPT_DIR/"
 cp "$SCRIPT_SOURCE_DIR/generate_excel.py" "$SCRIPT_DIR/"
 cp "$SCRIPT_SOURCE_DIR/requirements.txt" "$SCRIPT_DIR/"
+if [ -f "$SCRIPT_SOURCE_DIR/.benchmark_config" ]; then
+    cp "$SCRIPT_SOURCE_DIR/.benchmark_config" "$SCRIPT_DIR/"
+fi
 chmod 0755 "$SCRIPT_DIR/daily_go_benchmark_pipeline.sh"
 
 VENV_DIR="$BASE_DIR/.venv"
@@ -200,8 +359,6 @@ python -m pip install --no-cache-dir -r "$SCRIPT_SOURCE_DIR/requirements.txt"
 
 TODAY_DIR="$RESULTS_DIR/$TODAY"
 mkdir -p "$TODAY_DIR"
-LOG_FILE="$LOG_DIR/daily_pipeline_$TODAY.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
 START_TIME=$(date +%s)
 
 if [ ! -d "$GO_DIR/.git" ]; then
@@ -231,16 +388,20 @@ if ! ./make.bash; then
     exit 1
 fi
 
-if ! find_sibling_pair; then
-    echo "No adjacent logical CPU sibling pair was found; benchmark affinity is required." >&2
-    exit 1
-fi
-command -v taskset >/dev/null 2>&1 || { echo "taskset is required for benchmark CPU affinity." >&2; exit 1; }
 RAW_BENCH="$TODAY_DIR/benchmark_raw.txt"
 
-if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
-    echo "Benchmark execution failed." >&2
-    exit 1
+if [ -n "$CPU_SIBLING_PAIR" ]; then
+    echo "Running pinned to logical CPU sibling pair: $CPU_SIBLING_PAIR"
+    if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
+        echo "Benchmark execution failed." >&2
+        exit 1
+    fi
+else
+    echo "Running unpinned (single CPU)..."
+    if ! "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
+        echo "Benchmark execution failed." >&2
+        exit 1
+    fi
 fi
 
 # Metadata is written before comparison so it is preserved on a first run.

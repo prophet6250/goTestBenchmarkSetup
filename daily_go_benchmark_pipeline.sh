@@ -58,10 +58,11 @@ send_email() {
 }
 
 usage() {
-    echo "Usage: $0 [--tag TAG | --commit HASH] [--cron]"
+    echo "Usage: $0 [--tag TAG | --commit HASH] [--cron] [--test]"
     echo ""
     echo "With --tag or --commit, build and benchmark the specified Go revision."
     echo "With --cron, enforce the last Mon/Tue/Wed scheduling checks."
+    echo "With --test, run a fast test benchmark on a single package (fmt) with 1 iteration to verify mailing and pipeline."
     echo "Without options, clone/update and benchmark the current master branch on-demand."
 }
 
@@ -297,7 +298,11 @@ check_prerequisites() {
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
         if [ -n "${DEV_EMAILS:-}" ]; then
-            local subject="Go Benchmark Pre-requisites: "
+            local subject=""
+            if [ "${TEST_MODE:-false}" = true ]; then
+                subject+="[TEST MODE] "
+            fi
+            subject+="Go Benchmark Pre-requisites: "
             if [ "$status" -eq 0 ]; then
                 subject+="SUCCESS"
             else
@@ -449,7 +454,12 @@ copy_results_to_hosts() {
     if [ -z "${SCP_HOSTS:-}" ] || [ -z "${SCP_HOSTS//[[:space:]]/}" ]; then
         echo "WARNING: SCP hosts configuration (SCP_HOSTS) is missing. Skipping copy."
         if [ -n "${DEV_EMAILS:-}" ]; then
-            send_email "Go Benchmark: SCP Hosts Missing" "The benchmark completed successfully, but SCP_HOSTS is missing from $CONFIG_FILE. Skipping copy." "$DEV_EMAILS"
+            local subject=""
+            if [ "${TEST_MODE:-false}" = true ]; then
+                subject+="[TEST MODE] "
+            fi
+            subject+="Go Benchmark: SCP Hosts Missing"
+            send_email "$subject" "The benchmark completed successfully, but SCP_HOSTS is missing from $CONFIG_FILE. Skipping copy." "$DEV_EMAILS"
         fi
         return 0
     fi
@@ -474,7 +484,12 @@ copy_results_to_hosts() {
         local failed_hosts_str="${failed_hosts[*]}"
         echo "ERROR: Failed to copy results to hosts: $failed_hosts_str"
         if [ -n "${DEV_EMAILS:-}" ]; then
-            send_email "Go Benchmark: SCP Copy Failure" "The benchmark completed, but copying the results tarball ($tar_path) failed for: $failed_hosts_str." "$DEV_EMAILS"
+            local subject=""
+            if [ "${TEST_MODE:-false}" = true ]; then
+                subject+="[TEST MODE] "
+            fi
+            subject+="Go Benchmark: SCP Copy Failure"
+            send_email "$subject" "The benchmark completed, but copying the results tarball ($tar_path) failed for: $failed_hosts_str." "$DEV_EMAILS"
         fi
         return 1
     fi
@@ -487,6 +502,7 @@ parse_args() {
     REVISION_MODE=master
     REVISION=
     CRON_MODE=false
+    TEST_MODE=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --tag|--commit)
@@ -498,6 +514,10 @@ parse_args() {
                 ;;
             --cron)
                 CRON_MODE=true
+                shift
+                ;;
+            --test)
+                TEST_MODE=true
                 shift
                 ;;
             -h|--help) usage; exit 0 ;;
@@ -534,7 +554,12 @@ handle_error() {
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
         if [ -n "${DEV_EMAILS:-}" ]; then
-            send_email "Go Benchmark: Benchmark Execution FAILED" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details." "${DEV_EMAILS:-}"
+            local subject=""
+            if [ "${TEST_MODE:-false}" = true ]; then
+                subject+="[TEST MODE] "
+            fi
+            subject+="Go Benchmark: Benchmark Execution FAILED"
+            send_email "$subject" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details." "${DEV_EMAILS:-}"
         fi
     fi
 }
@@ -598,15 +623,23 @@ fi
 
 RAW_BENCH="$TODAY_DIR/benchmark_raw.txt"
 
+bench_target="./..."
+bench_count=6
+if [ "${TEST_MODE:-false}" = true ]; then
+    bench_target="fmt"
+    bench_count=1
+    echo "[TEST MODE] Running on single package '$bench_target' with 1 iteration."
+fi
+
 if [ -n "$CPU_SIBLING_PAIR" ]; then
     echo "Running pinned to logical CPU sibling pair: $CPU_SIBLING_PAIR"
-    if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
+    if ! taskset -c "$CPU_SIBLING_PAIR" "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
         echo "Benchmark execution failed." >&2
         exit 1
     fi
 else
     echo "Running unpinned (single CPU)..."
-    if ! "$GO_DIR/bin/go" test ./... -run=^$ -bench=. -benchmem -test.count=6 > "$RAW_BENCH"; then
+    if ! "$GO_DIR/bin/go" test "$bench_target" -run=^$ -bench=. -benchmem -test.count="$bench_count" > "$RAW_BENCH"; then
         echo "Benchmark execution failed." >&2
         exit 1
     fi
@@ -675,3 +708,18 @@ END_TIME=$(date +%s)
 echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
 echo "Metadata: $METADATA_FILE"
 log_run_history "${CURRENT_COMMIT:-master}" "SUCCESS" "Benchmark completed successfully in $((END_TIME - START_TIME)) seconds."
+
+# Send success email to devs
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    if [ -n "${DEV_EMAILS:-}" ]; then
+        subject=""
+        if [ "${TEST_MODE:-false}" = true ]; then
+            subject+="[TEST MODE] "
+        fi
+        subject+="Go Benchmark Execution SUCCESS"
+        body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.\n\nMetadata: $METADATA_FILE"
+        send_email "$subject" "$body" "$DEV_EMAILS"
+    fi
+fi

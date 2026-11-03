@@ -518,6 +518,15 @@ fi
 
 # Initialize Log File with Timestamp early
 mkdir -p "$BASE_DIR" "$RESULTS_DIR" "$LOG_DIR" "$SCRIPT_DIR"
+
+# Use a TMPDIR under the home directory: /tmp is small and benchmarks (e.g. net SendFile)
+# write large files there. It is wiped at start (in case an earlier run was killed) and
+# again on exit, on both success and failure (the failure email is sent before EXIT fires).
+BENCH_TMPDIR="$BASE_DIR/tmp"
+rm -rf "$BENCH_TMPDIR"
+mkdir -p "$BENCH_TMPDIR"
+export TMPDIR="$BENCH_TMPDIR"
+trap 'rm -rf "$BENCH_TMPDIR"' EXIT
 LOG_FILE="$LOG_DIR/daily_pipeline_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -544,7 +553,7 @@ handle_error() {
 				subject+="[TEST MODE] "
 			fi
 			subject+="Go Benchmark: Benchmark Execution FAILED"
-			send_email "$subject" "The benchmark execution has FAILED.\n\nCheck the log file at $LOG_FILE for details.$(metadata_for_email)" "${DEV_EMAILS:-}"
+			send_email "$subject" "The benchmark execution has FAILED (line $1, exit code $exit_code).\n\nThe script log and raw benchmark output are attached.$(metadata_for_email)" "${DEV_EMAILS:-}" "$LOG_FILE" "${RAW_BENCH:-}"
 		fi
 	fi
 }
@@ -684,7 +693,7 @@ echo "Benchmark pipeline completed in $((END_TIME - START_TIME)) seconds."
 echo "Metadata: $METADATA_FILE"
 log_run_history "${CURRENT_COMMIT:-master}" "SUCCESS" "Benchmark completed successfully in $((END_TIME - START_TIME)) seconds."
 
-# Send success email to devs with log, benchstat and metadata attached
+# Send success email to devs with the script log, raw benchmark output and benchstat (if any) attached
 if [ -f "$CONFIG_FILE" ]; then
 	# shellcheck disable=SC1090
 	source "$CONFIG_FILE"
@@ -695,6 +704,6 @@ if [ -f "$CONFIG_FILE" ]; then
 		fi
 		subject+="Go Benchmark Execution SUCCESS"
 		body="The benchmark execution completed successfully in $((END_TIME - START_TIME)) seconds.$(metadata_for_email)"
-		send_email "$subject" "$body" "$DEV_EMAILS" "$LOG_FILE" "$BENCHSTAT_FILE" "$METADATA_FILE"
+		send_email "$subject" "$body" "$DEV_EMAILS" "$LOG_FILE" "$RAW_BENCH" "$BENCHSTAT_FILE"
 	fi
 fi

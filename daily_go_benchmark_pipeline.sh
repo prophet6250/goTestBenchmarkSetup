@@ -95,7 +95,7 @@ usage() {
 	echo "Usage: $0 [--tag TAG | --commit HASH] [--cron] [--test]"
 	echo ""
 	echo "With --tag or --commit, build and benchmark the specified Go revision."
-	echo "With --cron, enforce the last Mon/Tue/Wed scheduling checks."
+	echo "With --cron, enforce the 4th-week Mon/Tue/Wed scheduling checks."
 	echo "With --test, run a fast test benchmark on a single package (fmt) with 1 iteration to verify mailing and pipeline."
 	echo "Without options, clone/update and benchmark the current master branch on-demand."
 }
@@ -282,7 +282,10 @@ ensure_cron_entry() {
 		script_path="$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh"
 	fi
 
-	local cron_cmd="0 2 22-31 * * $script_path --cron"
+	# Days 22-28 always contain the 4th occurrence of every weekday. The weekday
+	# itself is checked in should_run_cron_today (cron ORs day-of-month and
+	# day-of-week when both are restricted, so dow is left as '*').
+	local cron_cmd="0 2 22-28 * * $script_path --cron"
 	local existing
 	existing=$(crontab -l 2> /dev/null || true)
 
@@ -292,66 +295,29 @@ ensure_cron_entry() {
 
 	echo "Adding benchmark script to crontab..."
 	{
-		printf '%s\n' "$existing"
+		# Drop any older schedule for this script before adding the new one
+		printf '%s\n' "$existing" | grep -vF "$script_path --cron" || true
 		printf '%s\n' "$cron_cmd"
 	} | crontab -
 	echo "Crontab entry added successfully."
 }
 
-# Determine the last Mon, Tue, Wed of the current month
-get_last_mon_tue_wed() {
-	local y m last_day
-	y=$(date +%Y)
-	m=$(date +%m)
-
-	if date -d "today" > /dev/null 2>&1; then
-		last_day=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%d)
-	else
-		last_day=$(date -v1d -v+1m -v-1d +%d)
-	fi
-
-	LAST_MON=""
-	LAST_TUE=""
-	LAST_WED=""
-
-	for ((d = last_day; d >= last_day - 6; d--)); do
-		local dow
-		if date -d "today" > /dev/null 2>&1; then
-			dow=$(date -d "$y-$m-$d" +%u 2> /dev/null || true)
-		else
-			dow=$(date -j -f "%Y-%m-%d" "$y-$m-$d" +%u 2> /dev/null || true)
-		fi
-
-		if [ "$dow" = "1" ] && [ -z "$LAST_MON" ]; then
-			LAST_MON=$d
-		elif [ "$dow" = "2" ] && [ -z "$LAST_TUE" ]; then
-			LAST_TUE=$d
-		elif [ "$dow" = "3" ] && [ -z "$LAST_WED" ]; then
-			LAST_WED=$d
-		fi
-	done
-}
-
-# Cron scheduled run checks (earliest of last Mon, Tue, Wed precedence)
+# Cron scheduled run checks: Mon, Tue, Wed of the 4th week of the month
+# (the 4th occurrence of that weekday, i.e. day 22-28, regardless of date).
 should_run_cron_today() {
-	get_last_mon_tue_wed
-
 	local today_day today_dow current_month
 	today_day=$(date +%e | tr -d '[:space:]')
 	today_dow=$(date +%u) # 1=Mon, 2=Tue, 3=Wed
 	current_month=$(date +%Y-%m)
 
 	local is_target_day=false
-	if [ "$today_dow" = "1" ] && [ "$today_day" = "$LAST_MON" ]; then
-		is_target_day=true
-	elif [ "$today_dow" = "2" ] && [ "$today_day" = "$LAST_TUE" ]; then
-		is_target_day=true
-	elif [ "$today_dow" = "3" ] && [ "$today_day" = "$LAST_WED" ]; then
+	if [ "$today_dow" -ge 1 ] && [ "$today_dow" -le 3 ] &&
+		[ "$today_day" -ge 22 ] && [ "$today_day" -le 28 ]; then
 		is_target_day=true
 	fi
 
 	if [ "$is_target_day" = false ]; then
-		echo "Today is not the last Monday, Tuesday, or Wednesday of the month. Skipping scheduled run."
+		echo "Today is not a Monday, Tuesday, or Wednesday of the 4th week of the month. Skipping scheduled run."
 		return 1
 	fi
 
@@ -369,21 +335,9 @@ should_run_cron_today() {
 		return 1
 	fi
 
-	# Precedence logic: Mon -> Tue -> Wed
-	if [ "$today_dow" = "1" ]; then
-		echo "Today is last Monday of the month. Proceeding with run."
-		return 0
-	fi
-	if [ "$today_dow" = "2" ]; then
-		echo "Today is last Tuesday of the month, and no successful run recorded yet. Proceeding with run."
-		return 0
-	fi
-	if [ "$today_dow" = "3" ]; then
-		echo "Today is last Wednesday of the month, and no successful run recorded yet. Proceeding with run."
-		return 0
-	fi
-
-	return 1
+	# Mon is the first attempt; Tue and Wed are retries if no cron run succeeded yet.
+	echo "Today is a 4th-week weekday (dow=$today_dow) and no successful scheduled run recorded this month. Proceeding with run."
+	return 0
 }
 
 # Copy the individual result files into a per-run directory on each remote host.
@@ -566,10 +520,14 @@ if ! check_prerequisites; then
 	exit 1
 fi
 
-# Set up files in $SCRIPT_DIR
-cp "$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh" "$SCRIPT_DIR/"
-if [ -f "$SCRIPT_SOURCE_DIR/.benchmark_config" ]; then
-	cp "$SCRIPT_SOURCE_DIR/.benchmark_config" "$SCRIPT_DIR/"
+# Set up files in $SCRIPT_DIR (skip copy when already running from $SCRIPT_DIR)
+if [ "$SCRIPT_SOURCE_DIR" -ef "$SCRIPT_DIR" ]; then
+	echo "Script is already running from $SCRIPT_DIR; skipping copy."
+else
+	cp "$SCRIPT_SOURCE_DIR/daily_go_benchmark_pipeline.sh" "$SCRIPT_DIR/"
+	if [ -f "$SCRIPT_SOURCE_DIR/.benchmark_config" ]; then
+		cp "$SCRIPT_SOURCE_DIR/.benchmark_config" "$SCRIPT_DIR/"
+	fi
 fi
 chmod 0755 "$SCRIPT_DIR/daily_go_benchmark_pipeline.sh"
 

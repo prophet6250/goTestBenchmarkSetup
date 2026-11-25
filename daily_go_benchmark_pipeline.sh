@@ -165,7 +165,7 @@ check_prerequisites() {
 
 	# 3. Required packages check
 	local missing_pkgs=()
-	for cmd in git make gcc taskset; do
+	for cmd in git make gcc taskset curl; do
 		if ! command -v "$cmd" > /dev/null 2>&1; then
 			missing_pkgs+=("$cmd")
 		fi
@@ -578,6 +578,37 @@ EOF
 
 # NOTE: 'false' (rather than 'exit 1') is used below so the ERR trap sends the failure email.
 cd "$GO_DIR/src"
+
+# make.bash needs a bootstrap Go toolchain (version pinned by 'bootgo=' in make.bash).
+# Cron has no profile/PATH, so unless GOROOT_BOOTSTRAP is already set, use a cached
+# linux-s390x release under $BASE_DIR/bootstrap, downloading it only if missing.
+if [ -z "${GOROOT_BOOTSTRAP:-}" ]; then
+	boot_version=$(sed -n 's/^bootgo=\([0-9][0-9.]*\).*/\1/p' make.bash | head -n 1)
+	if [ -z "$boot_version" ]; then
+		echo "Unable to determine bootstrap Go version from make.bash." >&2
+		false
+	fi
+	BOOT_ROOT="$BASE_DIR/bootstrap/go${boot_version}"
+	if [ ! -x "$BOOT_ROOT/bin/go" ]; then
+		echo "Downloading bootstrap Go ${boot_version} (linux-s390x)..."
+		boot_tmp=$(mktemp -d)
+		if ! curl -fsSL "https://go.dev/dl/go${boot_version}.linux-s390x.tar.gz" -o "$boot_tmp/go.tar.gz" \
+			|| ! tar -C "$boot_tmp" -xzf "$boot_tmp/go.tar.gz"; then
+			rm -rf "$boot_tmp"
+			echo "Failed to download bootstrap Go ${boot_version}." >&2
+			false
+		fi
+		mkdir -p "$(dirname "$BOOT_ROOT")"
+		rm -rf "$BOOT_ROOT"
+		mv "$boot_tmp/go" "$BOOT_ROOT"
+		rm -rf "$boot_tmp"
+	else
+		echo "Using cached bootstrap Go ${boot_version}."
+	fi
+	export GOROOT_BOOTSTRAP="$BOOT_ROOT"
+fi
+echo "Using GOROOT_BOOTSTRAP=$GOROOT_BOOTSTRAP"
+
 if ! ./make.bash; then
 	echo "Go toolchain build failed." >&2
 	false

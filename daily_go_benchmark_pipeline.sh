@@ -659,12 +659,12 @@ if [ -n "$PREV_RAW" ]; then
 fi
 
 if [ "$HAS_PREVIOUS_RESULTS" = true ]; then
+	GOPATH_BIN="$("$GO_DIR/bin/go" env GOPATH 2> /dev/null || echo "$HOME/go")/bin"
+	export PATH="$GOPATH_BIN:$PATH"
 	if ! command -v benchstat > /dev/null 2>&1; then
 		echo "Installing benchstat..."
-		go install golang.org/x/perf/cmd/benchstat@latest || true
+		"$GO_DIR/bin/go" install golang.org/x/perf/cmd/benchstat@latest || true
 	fi
-	GOPATH_BIN="$(go env GOPATH 2> /dev/null || echo "$HOME/go")/bin"
-	export PATH="$GOPATH_BIN:$PATH"
 	if command -v benchstat > /dev/null 2>&1; then
 		benchstat -format=text "$PREV_RAW" "$RAW_BENCH" > "$BENCHSTAT_FILE"
 	else
